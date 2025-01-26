@@ -159,7 +159,6 @@ class PPOTrainer(ABC):
         self._wandb = None
         self._tensorboard = None
         if self.strategy.args.use_wandb and self.strategy.is_rank_0():
-            import wandb
 
             self._wandb = wandb
             if not wandb.api.api_key:
