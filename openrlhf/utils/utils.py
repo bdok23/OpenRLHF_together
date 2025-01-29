@@ -51,7 +51,8 @@ def blending_datasets(
     eval_data_list = []
     for i, dataset in enumerate(datasets):
         dataset = dataset.strip()
-        strategy.print(f"dataset: {dataset}")
+        if strategy:
+            strategy.print(f"dataset: {dataset}")
 
         data_dir = dataset.split("@")[1].strip() if "@" in dataset else None
         dataset = dataset.split("@")[0].strip()
@@ -63,22 +64,26 @@ def blending_datasets(
             os.path.isdir(dataset) and os.path.exists(os.path.join(dataset, f"{dataset_basename}.py"))
         ):
             data = load_dataset(dataset, trust_remote_code=True)
-            strategy.print(f"loaded {dataset} with python script")
+            if strategy:
+                strategy.print(f"loaded {dataset} with python script")
         # local text file
         elif ext in [".json", ".jsonl", ".csv"]:
             ext = ext.lower().strip(".")
             if ext == "jsonl":
                 ext = "json"
             data = load_dataset(ext, data_files=dataset)
-            strategy.print(f"loaded {dataset} with data_files={dataset}")
+            if strategy:
+                strategy.print(f"loaded {dataset} with data_files={dataset}")
         # local dataset saved with `datasets.Dataset.save_to_disk`
         elif os.path.isdir(dataset):
             data = load_from_disk(dataset)
-            strategy.print(f"loaded {dataset} from disk")
+            if strategy:
+                strategy.print(f"loaded {dataset} from disk")
         # remote/local folder or common file
         else:
             data = load_dataset(dataset, data_dir=data_dir)
-            strategy.print(f"loaded {dataset} from files")
+            if strategy:
+                strategy.print(f"loaded {dataset} from files")
 
         if train_split and train_split in data:
             train_data = data[train_split].select(range(min(max_count, len(data[train_split]))))
@@ -95,7 +100,7 @@ def blending_datasets(
             eval_data_list.append(eval_data)
 
     # merge datasets
-    if strategy.is_rank_0():
+    if strategy and strategy.is_rank_0():
         print(train_data_list)
 
     train_dataset = interleave_datasets(
