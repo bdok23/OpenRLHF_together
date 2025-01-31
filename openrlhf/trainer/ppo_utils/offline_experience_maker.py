@@ -3,6 +3,8 @@ from copy import deepcopy
 from .experience_maker import Experience, Samples
 from .experience_maker import NaiveExperienceMaker
 from typing import List
+from .kl_controller import FixedKLController, AdaptiveKLController
+from .experience_maker import compute_approx_kl, compute_reward
 
 class OfflineExperienceMaker(NaiveExperienceMaker):
     """
@@ -10,11 +12,37 @@ class OfflineExperienceMaker(NaiveExperienceMaker):
     reads completions and rewards from the dataset, instead of
     generating them on the fly.
     """
-    def __init__(self, *args, offline_dataset=None, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.offline_dataset = offline_dataset
-        self.tokenizer = args[0]  # Assuming the first argument is the tokenizer
-        self.device = kwargs.get('device', 'cuda')
+    def __init__(
+        self,
+        actor,
+        critic,
+        reward_model,
+        initial_model,
+        prompt_max_len: int,
+        kl_controller: FixedKLController,
+        tokenizer=None,
+        *args,
+        **kwargs
+    ):
+        # Pop offline_dataset from kwargs so it won't be passed to super().__init__()
+        self.offline_dataset = kwargs.pop("offline_dataset", None)
+
+        # any local device settings
+        self.device = kwargs.pop("device", "cuda")
+
+        super().__init__(
+            actor=actor,
+            critic=critic,
+            reward_model=reward_model,
+            initial_model=initial_model,
+            prompt_max_len=prompt_max_len,
+            kl_controller=kl_controller,
+            tokenizer=tokenizer,
+            *args,
+            **kwargs
+        )
+        
+        self.kl_ctl = kl_controller
         self.pad_token_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
 
     @torch.no_grad()
@@ -30,23 +58,18 @@ class OfflineExperienceMaker(NaiveExperienceMaker):
         
         for i, (prompt, completion, reward) in enumerate(self.offline_dataset):
             # Build an Experience with your already-known prompt, completion, reward
-            # 1) Convert prompt+completion into token IDs
-            # 2) Convert reward into a torch.Tensor
-            # 3) Possibly create "Samples" if you want the same shape as online code
-
-            prompt_ids = self.tokenizer(prompt, return_tensors="pt").input_ids.to("cuda")
-            completion_ids = self.tokenizer(completion, return_tensors="pt").input_ids.to("cuda")
+            prompt_ids = self.tokenizer(prompt, return_tensors="pt").input_ids.to(self.device)
+            completion_ids = self.tokenizer(completion, return_tensors="pt").input_ids.to(self.device)
 
             # Concatenate tokens so it looks like [prompt_ids, completion_ids]
             sequences = torch.cat([prompt_ids, completion_ids], dim=1)
 
-            # Build (attention_mask, action_mask) similarly if needed
-            # or if you use a simpler approach, you can place placeholders.
-            attention_mask = torch.ones_like(sequences).to("cuda")
-            action_mask = torch.zeros_like(sequences).to("cuda")
+            # Build attention_mask
+            attention_mask = torch.ones_like(sequences).to(self.device)
+            # Build action_mask (1 for completion tokens, 0 for prompt tokens)
+            action_mask = torch.zeros_like(sequences).to(self.device)
             action_mask[:, -completion_ids.size(1):] = 1
 
-            # Wrap them in a Samples object (mimicking the normal pipeline)
             samples = Samples(
                 sequences=sequences,
                 attention_mask=attention_mask,
@@ -57,62 +80,106 @@ class OfflineExperienceMaker(NaiveExperienceMaker):
                 total_length=attention_mask.float().sum(dim=-1),
             )
 
-            # Wrap them in an Experience
+            # Create Experience object with placeholders for log_probs/values
             exp = Experience(
-                samples,
-                reward=torch.tensor([reward], dtype=torch.float32).to("cuda"),
-                # For KL penalty, you can store "kl", or keep it None
-                kl=None,
+                sequences=sequences,
+                action_log_probs=torch.zeros_like(sequences),  # placeholder
+                values=torch.zeros(1, sequences.size(1)),      # placeholder
+                returns=None,
+                advantages=None,
+                attention_mask=attention_mask,
+                action_mask=action_mask,
+                info={
+                    "reward": torch.tensor([reward], dtype=torch.float32, device=self.device),
+                    "response_length": samples.response_length,
+                    "total_length": samples.total_length,
+                    "num_actions": action_mask.size(1),
+                },
+                kl=None,  # Will be calculated later
             )
-            # Also store any needed info, e.g. "response_length", "num_actions", etc.
-            exp.info = {
-                "reward": exp.reward,
-                "num_actions": action_mask.size(1),
-                "response_length": exp.samples.response_length,
-            }
 
-            # Move data to CPU for consistency
             exp.to_device("cpu")
             experiences.append(exp)
 
-        # Optionally process experiences the same way the parent does
+        # Now process experiences using parent's pipeline, which sets up
+        # references to advantage calculation etc.
         experiences, rewards = self.process_experiences(experiences)
 
-        # Since we already have the final reward, no kl or shaping is strictly needed
-        # but the parent's process_experiences() might do advantage estimation, etc.
-        # so let it do the GAE logic, if needed.
+        # Next, properly calculate advantages/returns 
         for experience, rew_val in zip(experiences, rewards):
-            experience = experience.to_device("cuda")
-            # If you want to run advantage calculation:
-            #   1) You might supply "experience.values" from a learned critic
-            #   2) Then call self.get_advantages_and_returns(...)
-            # Otherwise just store the offline advantage
-            # (If you have "raw advantage" in your dataset, you can place it here.)
-            experience.info["return"] = rew_val.sum().item()
+            experience = experience.to_device(self.device)
+            
+            with torch.no_grad():
+                # Current policy log probs
+                action_log_probs = self.actor(
+                    experience.sequences, 
+                    experience.info["num_actions"],
+                    experience.attention_mask
+                )
+                
+                # Base (initial) policy log probs
+                base_action_log_probs = self.initial_model(
+                    experience.sequences,
+                    experience.info["num_actions"], 
+                    experience.attention_mask
+                )
+                
+                # KL divergence
+                experience.kl = compute_approx_kl(
+                    action_log_probs,
+                    base_action_log_probs,
+                    action_mask=experience.action_mask,
+                    use_kl_estimator_k3=self.strategy.args.use_kl_estimator_k3
+                )
+
+            # final reward = dataset reward - KL * kl_coef (with optional clip)
+            reward_tensor = compute_reward(
+                rew_val,
+                self.kl_ctl.value,
+                experience.kl,
+                action_mask=experience.action_mask,
+                num_actions=experience.info["num_actions"],
+                reward_clip_range=self.strategy.args.reward_clip_range,
+            )
+
+            # advantage_estimator logic
+            if self.advantage_estimator == "gae":
+                experience.advantages, experience.returns = self.get_advantages_and_returns(
+                    experience.values,
+                    reward_tensor,
+                    experience.action_mask,
+                    generate_kwargs.get("gamma", 0.99),
+                    generate_kwargs.get("lambd", 0.95),
+                )
+            elif self.advantage_estimator in ["reinforce", "rloo"]:
+                experience.returns = self.get_cumulative_returns(
+                    reward_tensor,
+                    experience.action_mask,
+                    generate_kwargs.get("gamma", 0.99),
+                )
+                experience.advantages = experience.returns
+
+            experience.info["return"] = experience.returns.sum().item()
             experience.to_device("cpu")
 
         return experiences
 
     def make_experience_batch(self, batch: dict) -> List[Experience]:
+        """
+        Example of processing a batch instead of individual (prompt, completion, reward).
+        """
         experiences = []
-        
-        # Process batch
         for prompt_ids, completion_ids, reward in zip(
             batch["prompt_ids"], 
             batch["completion_ids"],
             batch["reward"]
         ):
-            # Combine prompt and completion
             input_ids = torch.cat([prompt_ids, completion_ids], dim=-1)
             
-            # Create attention mask
             attention_mask = torch.ones_like(input_ids)
-            
-            # Create action mask (only mask completion part)
             action_mask = torch.zeros_like(input_ids)
             action_mask[len(prompt_ids):] = 1
             
-            # Create samples
             samples = Samples(
                 sequences=input_ids.unsqueeze(0),
                 attention_mask=attention_mask.unsqueeze(0),
@@ -120,17 +187,22 @@ class OfflineExperienceMaker(NaiveExperienceMaker):
                 num_actions=len(completion_ids),
                 packed_seq_lens=None,
                 response_length=len(completion_ids),
-                total_length=len(input_ids)
+                total_length=len(input_ids),
             )
             
-            # Create experience
+            # For now, placeholders:
             exp = Experience(
-                samples=samples,
-                reward=reward,
-                values=torch.zeros_like(reward),  # Will be filled by critic
-                log_probs=torch.zeros_like(input_ids),  # Will be recalculated
-                advantages=torch.zeros_like(reward),
-                returns=torch.zeros_like(reward),
+                sequences=input_ids.unsqueeze(0),
+                action_log_probs=torch.zeros(1, input_ids.size(-1)),
+                values=torch.zeros(1, input_ids.size(-1)),
+                returns=None,
+                advantages=None,
+                attention_mask=attention_mask.unsqueeze(0),
+                action_mask=action_mask.unsqueeze(0),
+                info={
+                    "reward": torch.tensor([reward], dtype=torch.float32),
+                    "num_actions": len(completion_ids)
+                },
                 kl=None
             )
             
