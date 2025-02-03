@@ -328,6 +328,13 @@ def train_offline(args):
         num_update_steps_per_episodes=num_update_steps_per_episodes
     )
 
+    # After training completes
+    strategy.save_model(
+        ema_model if args.enable_ema else actor,
+        tokenizer,
+        args.save_path,
+    )
+
 if __name__ == "__main__":
     parser = ArgumentParser()
     
@@ -481,7 +488,29 @@ if __name__ == "__main__":
     parser.add_argument("--disable_ds", action="store_true", default=False)
     parser.add_argument("--offline_data_path", type=str, required=True)  # is used for offline
 
-
-
     args = parser.parse_args()
+    
+    
+    if args.advantage_estimator not in ["gae"]:
+        args.critic_pretrain = None
+    elif args.critic_pretrain is None:
+        if not args.remote_rm_url:
+            args.critic_pretrain = args.reward_pretrain
+        else:
+            args.critic_pretrain = args.pretrain
+
+    if args.advantage_estimator == "rloo":
+        assert args.n_samples_per_prompt > 1, "RLOO requires n_samples_per_prompt > 1"
+
+    if args.input_template and "{}" not in args.input_template:
+        print("[Warning] {} not in args.input_template, set to None")
+        args.input_template = None
+
+    if args.input_template and "\\n" in args.input_template:
+        print(
+            "[Warning] input_template contains \\n chracters instead of newline. "
+            "You likely want to pass $'\\n' in Bash or \"`n\" in PowerShell."
+        )
+        
+        
     train_offline(args) 

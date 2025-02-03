@@ -60,7 +60,7 @@ class OfflineExperienceMaker(NaiveExperienceMaker):
             return []
 
         experiences = []
-        # Build raw Experience objects from offline_dataset
+        # build raw Experience objects from offline_dataset
         for i, (prompt, completion, reward) in enumerate(self.offline_dataset):
             # ---------------
             # 1) Tokenize
